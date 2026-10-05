@@ -13,6 +13,9 @@ it — roughly a sixth of the ~980 MB mainstream editors can idle at.
 > extras like Dim Mode talk to Windows (WMI) directly. Portability comes
 > later; honesty first.
 
+> **Official site:** [snor.is-a.dev](https://snor.is-a.dev/) — downloads
+> (portable + installer), docs, and the story behind Snor.
+
 ## Why Snor?
 
 AI coding agents are incredibly powerful, but the experience around them still
