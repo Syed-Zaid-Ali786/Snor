@@ -191,6 +191,33 @@ pub struct SetupApp {
     window_fitted: bool,
 }
 
+/// What Escape means on a screen of the wizard.
+///
+/// Split out from the key handling because "leave the wizard" and "stop editing
+/// the folder" are two different intents, and the manual run's A2 was them being
+/// conflated: Escape in the install-folder field closed the whole window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EscapeAction {
+    /// Nothing is focused and nothing is running, so there is no state to
+    /// abandon: Escape leaves.
+    Close,
+    /// A field has focus. Escape belongs to the field, and the wizard stays.
+    StopEditing,
+    /// An install or uninstall is running. There is no half-done state to cancel
+    /// back out of, so Escape does nothing at all.
+    Ignore,
+}
+
+fn escape_action(editing: bool, busy: bool) -> EscapeAction {
+    if busy {
+        EscapeAction::Ignore
+    } else if editing {
+        EscapeAction::StopEditing
+    } else {
+        EscapeAction::Close
+    }
+}
+
 impl SetupApp {
     pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
         // The app's own entry-point pair: the same faces, the same palette.
@@ -434,15 +461,27 @@ impl SetupApp {
         let editing = ui.memory(|m| m.focused().is_some());
         let enter =
             !editing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        // Escape closes from anywhere except a running install — but not while a
-        // text field owns the keyboard. `enter` above was already guarded this
-        // way; `escape` was not, so pressing Escape to dismiss a path field closed
-        // the whole wizard mid-edit instead of just the field.
-        let escape = !editing
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if escape && self.screen != Screen::Progress {
-            self.close(ui.ctx());
-            return;
+        // Escape is always consumed here, so nothing downstream can act on it as
+        // well; what it *means* is `escape_action`'s. Enter above was already
+        // guarded this way and Escape was not, so pressing Escape to dismiss a
+        // path field closed the whole wizard mid-edit.
+        let pressed = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if pressed {
+            match escape_action(editing, self.screen == Screen::Progress) {
+                EscapeAction::StopEditing => {
+                    // The field gives up focus, so the wizard stays open and the
+                    // *next* Escape leaves from a known state rather than from
+                    // one the user has to guess at.
+                    if let Some(id) = ui.memory(|m| m.focused()) {
+                        ui.memory_mut(|m| m.surrender_focus(id));
+                    }
+                }
+                EscapeAction::Close => {
+                    self.close(ui.ctx());
+                    return;
+                }
+                EscapeAction::Ignore => {}
+            }
         }
 
         ui.horizontal(|ui| {
@@ -816,5 +855,81 @@ mod tests {
             PathBuf::from("C:\\Program Files\\Snor")
         );
         assert_eq!(clean_dir("C:\\Snor"), PathBuf::from("C:\\Snor"));
+    }
+
+    /// Escape has three meanings, and conflating two of them is what closed the
+    /// whole wizard from inside the folder field during the manual run.
+    #[test]
+    fn escape_means_one_of_three_things() {
+        // Nothing focused, nothing running: leave.
+        assert_eq!(escape_action(false, false), EscapeAction::Close);
+        // A field has focus: the field takes it, the wizard stays. This is A2.
+        assert_eq!(escape_action(true, false), EscapeAction::StopEditing);
+        // Running an install or uninstall: nothing to cancel back into.
+        assert_eq!(escape_action(false, true), EscapeAction::Ignore);
+        assert_eq!(escape_action(true, true), EscapeAction::Ignore);
+    }
+
+    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            time: Some(0.1),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// The premise `escape_action` rests on: a clicked `TextEdit` really does hold
+    /// egui focus, so `m.focused()` is not `None` while the folder is being edited.
+    ///
+    /// If this ever stops holding, `StopEditing` degrades into `Close` and A2
+    /// comes back — which is what the manual run reported against a build that
+    /// guarded the key but trusted this read.
+    #[test]
+    fn a_clicked_folder_field_reports_itself_as_focused() {
+        let ctx = egui::Context::default();
+        let mut dir = String::from(r"C:\Snor");
+        let mut field = egui::Rect::ZERO;
+
+        // Frame 0: the field exists. egui hit-tests against the previous frame's
+        // rects, so it cannot be pressed on the frame it first appears.
+        let out = ctx.run_ui(raw(vec![]), |ui| {
+            field = ui.add(egui::TextEdit::singleline(&mut dir)).rect;
+        });
+        out.drop_without_applying_deltas();
+        assert!(
+            field.width() > 0.0 && field.height() > 0.0,
+            "the field has no rect"
+        );
+
+        // Frame 1: the pointer arrives and presses.
+        let at = field.center();
+        let out = ctx.run_ui(
+            raw(vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut dir));
+            },
+        );
+        out.drop_without_applying_deltas();
+
+        // Frame 2: the focus read `action_bar` performs, before it consumes keys.
+        let out = ctx.run_ui(raw(vec![]), |ui| {
+            assert!(
+                ui.memory(|m| m.focused().is_some()),
+                "a clicked text field must report as focused"
+            );
+        });
+        out.drop_without_applying_deltas();
     }
 }

@@ -1,6 +1,6 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
 const ROWS: u16 = 24;
@@ -448,6 +448,21 @@ fn cell_at_pos(
     (row, col)
 }
 
+/// Whether two paths name the same directory, tolerating the spellings Windows
+/// allows — different case, a trailing separator, a `\\?\` prefix.
+///
+/// Used to decide whether the visible shell can run a command where the caller
+/// wants it, so a comparison that called `C:\x` and `c:\x\` different would open
+/// a fresh terminal on every single Run. Falls back to a plain comparison when
+/// either path cannot be canonicalised, so it stays usable for a directory that
+/// does not exist.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a == b,
+    }
+}
+
 /// One find-in-terminal hit.
 ///
 /// `offset` is how far back in the history it was found, which is also how
@@ -502,8 +517,16 @@ fn find_hits(screen: &mut vt100::Screen, query: &str, at: usize, cap: usize) -> 
     let mut hits: Vec<FindHit> = Vec::new();
     // The live screen first, and whole: it is the newest output and the only part
     // of the grid the user is looking at.
+    //
+    // Bottom row first, and that is the whole subtlety. The live screen is one
+    // window of many matches, so its rows have an order too, and the newest line
+    // printed is its *last* row: scanning `0..rows` reported the oldest line on
+    // screen as the first hit. With a short pane showing `needle 288`..`needle
+    // 300`, find then landed on 288 and reported it as `1/200` — the opposite of
+    // what "newest first" means, and invisible to a test that only checked which
+    // *offset* a hit was on.
     screen.set_scrollback(0);
-    for row in 0..rows {
+    for row in (0..rows).rev() {
         scan_row(screen, row, cols, &needle, 0, &mut hits);
         if hits.len() >= cap {
             break;
@@ -1509,15 +1532,32 @@ impl Terminal {
         }
     }
 
-    /// Send a full shell line (used by the editor Run button).
+    /// Whether the visible shell can run a command in `dir`, or a shell has to be
+    /// opened there first.
     ///
-    /// Goes to the active shell: that is the one whose output the user is
-    /// watching, and the one the Run button's result should land in. Goes through
-    /// [`Terminal::reveal`], which un-hides the section and spawns a shell if the
-    /// panel was emptied — so Run always has somewhere the user can see, rather
-    /// than a shell hidden behind a closed panel.
-    pub fn send_line(&mut self, line: &str, cwd: &PathBuf) {
-        self.reveal(cwd);
+    /// The command executes in the *shell's* directory, so a shell sitting
+    /// somewhere else is no use however right the caller's directory is. Split out
+    /// from [`Terminal::send_line_in`] so the rule is testable without a pty.
+    fn needs_shell_in(active: Option<&Path>, dir: &Path) -> bool {
+        active.is_none_or(|cwd| !same_dir(cwd, dir))
+    }
+
+    /// Send `line` to a shell that is *in* `dir`, opening one there when the
+    /// visible shell is somewhere else.
+    ///
+    /// This is what the Run button needs. It replaced a `send_line` that took a
+    /// directory but only used it to spawn, so with a shell already open it typed into
+    /// whichever shell that was — and for an installed copy that is a shell in
+    /// the install folder, so `cargo run` failed with no `Cargo.toml` anywhere
+    /// near it. Opening a shell in the right directory costs one tab, and only
+    /// the first time: afterwards the active shell is already there.
+    pub fn send_line_in(&mut self, line: &str, dir: &PathBuf) {
+        let elsewhere = Self::needs_shell_in(self.session().map(|s| s.cwd.as_path()), dir);
+        if elsewhere {
+            self.open_at(dir);
+        } else {
+            self.reveal(dir);
+        }
         self.active = true;
         let mut s = line.to_string();
         if !s.ends_with('\r') && !s.ends_with('\n') {
@@ -2257,30 +2297,18 @@ impl Terminal {
                 session.selection = None;
             }
         }
-        // Ctrl+Shift+C copies rather than interrupts. The other terminal
-        // convention is the one everyone already has in their fingers, and it is
-        // the only way to keep Ctrl+C as SIGINT without a collision;
-        // `key_to_bytes` refuses the shifted form so it never reaches the shell.
-        //
-        // The chord is consumed only when there is a selection to copy. Consuming
-        // it unconditionally made Ctrl+Shift+C dead for the whole app while
-        // nothing was selected — a shortcut that silently ate keystrokes for no
-        // benefit at all.
-        let copy_text_now = self
-            .session()
-            .and_then(|s| s.selection.map(|sel| selection_text(s.parser.screen(), sel)))
-            .filter(|text| !text.is_empty());
-        let copy_key = copy_text_now.is_some()
-            && ui.input_mut(|i| {
-                i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
-                    eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
-                    eframe::egui::Key::C,
-                ))
-            });
-        if (copy_clicked || copy_key)
-            && let Some(text) = copy_text_now
+        // Copy on the button. The Ctrl+Shift+C chord lives in `forward_events`,
+        // which is the only place that knows which shell is focused — so a Flow
+        // pane copies too, which it could not before, having neither a selection
+        // to copy nor a chord that reached it.
+        if copy_clicked
+            && let Some(session) = self.session()
+            && let Some(sel) = session.selection
         {
-            ui.ctx().copy_text(text);
+            let text = selection_text(session.parser.screen(), sel);
+            if !text.is_empty() {
+                ui.ctx().copy_text(text);
+            }
         }
         if paste_clicked {
             // Asking the backend for the clipboard, which arrives as
@@ -2511,6 +2539,39 @@ impl Terminal {
         let events = ui.input(|i| i.events.clone());
         let pointer_busy = ui.input(|i| i.pointer.any_click());
         let focused_none = ui.memory(|m| m.focused().is_none());
+
+        // Ctrl+Shift+C copies the focused shell's selection, in either layout.
+        //
+        // It lives here rather than in `ui` because this is the only place that
+        // knows which shell is focused: `target` is the Flow pane, `None` the
+        // active tab. Wired to the tabbed grid alone, the chord did nothing at all
+        // in Flow Mode — and a pane could not be selected from either, so there
+        // was nothing for it to copy.
+        //
+        // Copied through `selection_text`, so the grid's full-width padding is
+        // trimmed exactly as it is in the tabbed layout.
+        //
+        // Consumed only when there is something to copy, or it would be dead for
+        // the whole app whenever nothing was selected.
+        let selected = match target {
+            Some(id) => self.sessions.iter().find(|s| s.id == id),
+            None => self.session(),
+        }
+        .and_then(|s| {
+            s.selection
+                .map(|sel| selection_text(s.parser.screen(), sel))
+        })
+        .filter(|text| !text.is_empty());
+        let copy_key = selected.is_some()
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
+                    eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
+                    eframe::egui::Key::C,
+                ))
+            });
+        if copy_key && let Some(text) = selected {
+            ui.ctx().copy_text(text);
+        }
 
         // Ctrl+Shift+V pastes into the shell. Handled here rather than in `ui`
         // so Flow Mode panes get it too: it used to live only in the tabbed
@@ -3546,10 +3607,9 @@ impl<'a> FlowView<'a> {
                         s.apply_scroll();
                         let markup = Markup {
                             font_size: self.view.font_size,
-                            // Panes have no drag selection of their own — the
-                            // tabbed grid is where selecting and copying lives —
-                            // but the field is carried through so both layouts
-                            // render through the same function.
+                            // Each pane selects on its own session, and the tint
+                            // comes from the same field in both layouts, so the
+                            // two render through one function.
                             selection: s.selection_range(),
                             search: None,
                             cursor: s.scroll == 0,
@@ -3559,6 +3619,14 @@ impl<'a> FlowView<'a> {
                     None => return,
                 };
                 let mut clicked = false;
+                // Drag is as load-bearing here as it is in the tabbed layout: a
+                // pane that senses only a click cannot be selected from, so
+                // Ctrl+Shift+C had nothing to copy and the manual run reported
+                // "dragging across text did nothing". Click still focuses the
+                // pane and latches typing exactly as before.
+                let mut drag_from: Option<(u16, u16)> = None;
+                let mut drag_to: Option<(u16, u16)> = None;
+                let mut drag_done = false;
                 // A plain scope, matching the tabbed layout: history is the
                 // vt100 screen's, so an inner scroller would only fight it.
                 ui.scope_builder(
@@ -3570,16 +3638,49 @@ impl<'a> FlowView<'a> {
                             let resp = ui.add(
                                 eframe::egui::Label::new(job)
                                     .extend()
+                                    // Selection is ours, as in the tabbed grid:
+                                    // a `Label`'s own selection would copy the
+                                    // full-width padding and fight the tint.
                                     .selectable(false)
-                                    .sense(eframe::egui::Sense::click()),
+                                    .sense(eframe::egui::Sense::click_and_drag()),
                             );
                             clicked = resp.clicked();
+                            let at = resp
+                                .interact_pointer_pos()
+                                .map(|pos| cell_at_pos(grid_rect.min, cell, pos));
+                            if resp.drag_started() {
+                                drag_from = at;
+                            } else if resp.dragged() {
+                                drag_to = at;
+                            }
+                            if resp.drag_stopped() {
+                                drag_done = true;
+                            }
                         });
                     },
                 );
                 if clicked {
                     *self.focus = Some(id);
                     *self.latched = true;
+                }
+                // The selection lands on this pane's own session, so each pane
+                // keeps its own and the tint comes from the same place in both
+                // layouts.
+                let dragging = drag_from.is_some() || drag_to.is_some() || drag_done;
+                if dragging
+                    && let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
+                {
+                    if let Some(start) = drag_from {
+                        session.selection = Some(Selection::new(start));
+                    } else if let Some(head) = drag_to
+                        && let Some(sel) = session.selection.as_mut()
+                    {
+                        sel.head = head;
+                    }
+                    // A press that never moved is a click, not a selection.
+                    if drag_done && session.selection.is_some_and(|s| s.is_click()) {
+                        session.selection = None;
+                    }
                 }
             },
         );
@@ -3619,8 +3720,8 @@ impl Drop for Terminal {
 mod tests {
     use super::{
         FIND_CAP, NOTIF_TAIL_MAX, Notifications, Selection, Session, ShellKind, Terminal,
-        cell_at_pos, find_hits, PANE_ACTIVE_SECS, flow_shape, installed_from, scan_notifications,
-        selection_text, shell_title, short_idle, term_size_for_pixels,
+        cell_at_pos, find_hits, same_dir, PANE_ACTIVE_SECS, flow_shape, installed_from,
+        scan_notifications, selection_text, shell_title, short_idle, term_size_for_pixels,
     };
     use eframe::egui::{Key, Modifiers};
 
@@ -3987,6 +4088,40 @@ mod tests {
         assert!(t.sessions.is_empty(), "and the tab itself is gone");
     }
 
+    /// A command must land in a shell that is already in the directory asked for.
+    ///
+    /// `send_line`'s directory only ever decided where a *new* shell spawned, so
+    /// with a shell already open the command ran wherever that shell was — which
+    /// for an installed copy is the install folder, where `cargo run` fails with
+    /// no `Cargo.toml` anywhere near it.
+    #[test]
+    fn a_command_only_opens_a_shell_when_the_visible_one_is_elsewhere() {
+        let here = std::env::temp_dir();
+        let other = here.join("snor-send-line-in");
+        assert!(
+            Terminal::needs_shell_in(None, &here),
+            "no shell at all needs one opened"
+        );
+        assert!(
+            !Terminal::needs_shell_in(Some(here.as_path()), &here),
+            "a shell already there is reused"
+        );
+        assert!(
+            Terminal::needs_shell_in(Some(here.as_path()), &other),
+            "a shell somewhere else is no use"
+        );
+    }
+
+    /// A directory comparison that calls two spellings of one path different
+    /// would open a fresh terminal on every Run.
+    #[test]
+    fn two_spellings_of_one_directory_are_one_directory() {
+        let dir = std::env::temp_dir();
+        assert!(same_dir(&dir, &dir));
+        assert!(same_dir(&dir, &std::fs::canonicalize(&dir).unwrap()));
+        assert!(!same_dir(&dir, &dir.join("child")));
+    }
+
     // --- Scrollback, selection, search, attention, shells ----------------
 
     /// Hermetic: `ingest` is the same call `poll` makes, so these exercise the
@@ -4156,6 +4291,41 @@ mod tests {
         assert!(
             many.windows(2).all(|w| w[0].offset <= w[1].offset),
             "hits must come back newest first: {many:?}"
+        );
+    }
+
+    /// The first hit must be the newest match *on the screen*, not merely one
+    /// somewhere on the live screen.
+    ///
+    /// This is what the manual run caught and the offset-only test could not: with
+    /// a short pane the live screen shows only the last dozen lines, and scanning
+    /// it top-down reported `needle 288` as `1/200` while `needle 299` — the line
+    /// just printed — sat at the bottom. The assertion is on the text under the
+    /// hit, because the offset was correct in both orders.
+    #[test]
+    fn the_first_hit_is_the_newest_line_not_the_oldest_visible_one() {
+        let mut t = Terminal::new();
+        for i in 0..300 {
+            sm(&mut t).ingest(format!("needle {i}\r\n").as_bytes());
+        }
+        let hits = find_hits(sm(&mut t).parser.screen_mut(), "needle", 0, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].offset, 0, "it is on the live screen");
+
+        let screen = s(&t).parser.screen();
+        let cols = screen.size().1;
+        let row_text: String = (0..cols)
+            .map(|c| {
+                screen
+                    .cell(hits[0].row, c)
+                    .map(|cell| cell.contents().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            row_text.contains("needle 299"),
+            "the first hit is on row {} which reads {row_text:?}",
+            hits[0].row
         );
     }
 

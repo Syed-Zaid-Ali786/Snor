@@ -618,7 +618,6 @@ terminal_font = 14
         let text = s.clone().clamped().render();
         assert_eq!(Settings::parse(&text).ui_scale, UI_SCALE_MAX);
     }
-
     #[test]
     fn floats_render_without_an_exponent_or_a_trailing_zero() {
         assert_eq!(fmt_f32(12.5), "12.5");
@@ -644,5 +643,25 @@ terminal_font = 14
         assert!(unknown_shell("shell =\n").is_none());
         assert!(unknown_shell("# shell = nu\n").is_none());
         assert!(unknown_shell("").is_none());
+    }
+
+    /// The complaint is about the file, so rewriting the file resolves it — which
+    /// is what lets the app clear the notice on a successful save instead of
+    /// carrying it for the rest of the session.
+    #[test]
+    fn a_rewritten_file_no_longer_carries_an_unknown_shell() {
+        let bad = Settings::parse("shell = nu\n");
+        assert_eq!(bad.shell, ShellKind::PowerShell, "the fallback stays");
+        assert!(
+            unknown_shell("shell = nu\n").is_some_and(|m| m.contains("nu")),
+            "the file as written is the thing that is wrong"
+        );
+
+        let rendered = bad.render();
+        assert!(
+            unknown_shell(&rendered).is_none(),
+            "render always writes a shell this build knows"
+        );
+        assert_eq!(Settings::parse(&rendered).shell, bad.shell);
     }
 }

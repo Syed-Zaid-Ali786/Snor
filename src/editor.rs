@@ -808,6 +808,16 @@ impl Editor {
         }
     }
 
+    /// The file in front of the user, if any.
+    ///
+    /// Nothing else in the app asks the editor this, because a path is not a
+    /// language: `SnorApp::command_dir` is the one caller that needs to know
+    /// which project the user is looking at, so that a command runs there rather
+    /// than wherever the process happened to start.
+    pub fn active_path(&self) -> Option<PathBuf> {
+        self.tabs.get(self.active).map(|b| b.path.clone())
+    }
+
     pub fn active_lang(&self) -> String {
         self.tabs
             .get(self.active)

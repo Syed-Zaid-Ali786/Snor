@@ -263,6 +263,16 @@ pub struct SnorApp {
     /// A failed write, shown in the panel so a toggle that will not persist
     /// says so instead of looking like it worked.
     settings_error: Option<String>,
+    /// What the settings file asked for that this build cannot do, raised when
+    /// the file was read and kept until the file is rewritten.
+    ///
+    /// Separate from `settings_error` because the two have opposite lifetimes. A
+    /// save error belongs to the last write and is cleared when the panel is
+    /// reopened; this is a standing fact about the file on disk, so clearing it
+    /// on open meant the panel could never show it — the one place it would ever
+    /// be shown. The manual run had `shell = nu` in the file, Snor correctly fell
+    /// back to PowerShell, and the panel showed nothing at all.
+    settings_notice: Option<String>,
 }
 
 impl SnorApp {
@@ -310,7 +320,8 @@ impl SnorApp {
             settings_open: false,
             settings_dirty: false,
             refit_pending: false,
-            settings_error: settings_warning,
+            settings_error: None,
+            settings_notice: settings_warning,
             flow: false,
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
@@ -394,6 +405,16 @@ impl SnorApp {
     /// always draw — nothing next to the copy a single pty spawn costs.
     fn workdir(&self) -> PathBuf {
         self.folder.clone().unwrap_or_else(|| self.start_cwd.clone())
+    }
+
+    /// Where Run should run. See [`command_dir`] for the order and the why.
+    fn command_dir(&self) -> PathBuf {
+        command_dir(
+            self.folder.as_deref(),
+            self.editor.active_path().as_deref(),
+            &self.tree.root,
+            &self.start_cwd,
+        )
     }
     fn poll_branch(&mut self) {
         const POLL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -695,6 +716,14 @@ impl SnorApp {
                         .small()
                         .color(theme::faint()),
                 );
+                if let Some(note) = &self.settings_notice {
+                    // `danger()` is wrong here: the app is working, it is doing
+                    // something other than what the file asked for. The palette
+                    // has no warning tone, so the notice is drawn in the tagline
+                    // ink — quieter than an error without pretending to be a
+                    // heading.
+                    ui.label(egui::RichText::new(note).small().color(theme::tagline()));
+                }
                 if let Some(err) = &self.settings_error {
                     ui.label(egui::RichText::new(err).small().color(theme::danger()));
                 }
@@ -1566,6 +1595,43 @@ impl SnorApp {
     }
 }
 
+/// Where a command should run, given what the app knows.
+///
+/// Four candidates, in the order that best answers "which project is the user
+/// working on":
+///
+/// 1. The workspace they chose — the only one they explicitly picked.
+/// 2. The directory of the file in front of them. Cargo searches upward for
+///    `Cargo.toml`, so a file under `src/` still runs the project it belongs to.
+/// 3. The folder the explorer is showing. Auto context following moves that to
+///    the shell being typed in, so this is the directory in front of the user
+///    even when they never chose one.
+/// 4. The launch directory.
+///
+/// The launch directory is *last* because for an installed copy it is the install
+/// folder, and a command run there fails with "could not find `Cargo.toml`" —
+/// which is exactly what the manual run reported. It stays as the fallback
+/// because a shell still has to start somewhere.
+///
+/// Pure, and split out from the app shell so the order can be tested without a
+/// window: the precedence is the whole of the fix.
+fn command_dir(
+    workspace: Option<&std::path::Path>,
+    open_file: Option<&std::path::Path>,
+    tree_root: &std::path::Path,
+    launch: &std::path::Path,
+) -> PathBuf {
+    let of_file = open_file
+        .and_then(std::path::Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(PathBuf::from);
+    workspace
+        .map(PathBuf::from)
+        .or(of_file)
+        .or_else(|| (!tree_root.as_os_str().is_empty()).then(|| tree_root.to_path_buf()))
+        .unwrap_or_else(|| launch.to_path_buf())
+}
+
 impl eframe::App for SnorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.fit_window_on_first_frame(ui.ctx());
@@ -1579,8 +1645,11 @@ impl eframe::App for SnorApp {
             self.editor.open_file(opened);
         }
         if std::mem::take(&mut self.editor.want_run) {
-            let workdir = self.workdir();
-            self.terminal.send_line("cargo run", &workdir);
+            // Not `workdir()`: that is where a *shell* may start, and for an
+            // installed copy the launch directory is the install folder. Run has
+            // to land in the project in front of the user.
+            let dir = self.command_dir();
+            self.terminal.send_line_in("cargo run", &dir);
         }
         // The empty editor's two actions. The editor has no handle on the file
         // tree, so it raises a flag and the shell does the work. Both reveal
@@ -1890,6 +1959,13 @@ impl eframe::App for SnorApp {
             }
             if self.settings_dirty {
                 self.settings_error = self.settings.save().err();
+                // The file has just been rendered in full, and `render` always
+                // writes a `shell =` this build knows — so whatever the reader
+                // complained about is gone from the file, and saying so again
+                // would be stale.
+                if self.settings_error.is_none() {
+                    self.settings_notice = None;
+                }
                 self.settings_dirty = false;
             }
         }
@@ -2029,5 +2105,35 @@ mod tests {
             assert!(size.y <= MIN_USABLE_H.max(my - TASKBAR_RESERVE));
             assert!(pos.x.is_finite() && pos.y.is_finite(), "non-finite at {mx}x{my}");
         }
+    }
+
+    /// Run must land in the project in front of the user, not in the directory the
+    /// process happened to start in.
+    ///
+    /// The manual run's report was `cargo run` failing with no `Cargo.toml`
+    /// because it executed in `%LOCALAPPDATA%\Programs\Snor` — the install folder,
+    /// which is where an installed copy starts. This pins the order that stops it.
+    #[test]
+    fn a_command_runs_in_the_project_the_user_is_looking_at() {
+        let ws = std::path::PathBuf::from(r"C:\work\repo");
+        let file = std::path::PathBuf::from(r"C:\work\repo\src\main.rs");
+        let tree = std::path::PathBuf::from(r"C:\work\repo");
+        let launch = std::path::PathBuf::from(r"C:\Users\me\AppData\Local\Programs\Snor");
+
+        // A chosen workspace wins: it is the only thing the user picked.
+        assert_eq!(command_dir(Some(&ws), Some(&file), &tree, &launch), ws);
+        // With no workspace, the file in front of the user decides. Cargo searches
+        // upward, so a file under src/ still runs the project it belongs to.
+        assert_eq!(
+            command_dir(None, Some(&file), &tree, &launch),
+            std::path::PathBuf::from(r"C:\work\repo\src")
+        );
+        // Nothing open: the folder the explorer is showing.
+        assert_eq!(command_dir(None, None, &tree, &launch), tree);
+        // An empty tree root names no folder, so it must not be chosen.
+        assert_eq!(
+            command_dir(None, None, std::path::Path::new(""), &launch),
+            launch
+        );
     }
 }
