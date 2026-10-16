@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const LARGE_FILE_BYTES: usize = 500_000;
@@ -474,7 +475,17 @@ impl OpenBuffer {
     /// disk is either the old contents or the new ones, never half of each.
     fn save(&mut self) -> anyhow::Result<()> {
         let tmp = temp_sibling(&self.path);
-        if let Err(e) = std::fs::write(&tmp, &self.text) {
+        // Exclusively create our temporary file: a pre-existing sibling may
+        // belong to the user or another Snor process. Never truncate or remove it.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let written = file
+            .write_all(self.text.as_bytes())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
@@ -652,6 +663,9 @@ impl Editor {
             return !self.tabs.is_empty();
         }
         self.tabs.remove(idx);
+        if idx < self.active {
+            self.active -= 1;
+        }
         if self.tabs.is_empty() {
             self.active = 0;
             self.find_open = false;
@@ -1047,8 +1061,7 @@ impl Editor {
                                             },
                                         );
                                         // Same as the terminal's tab strip.
-                                        if crate::widgets::clickable_label(ui, text).clicked()
-                                        {
+                                        if crate::widgets::clickable_label(ui, text).clicked() {
                                             self.active = idx;
                                             tab_switched = true;
                                         }
@@ -1260,9 +1273,7 @@ impl Editor {
                 let name = self.tabs[self.active].name();
                 self.note = Some((format!("reloaded {name}"), std::time::Instant::now()));
             }
-            if keep
-                && let Some(buf) = self.tabs.get_mut(self.active)
-            {
+            if keep && let Some(buf) = self.tabs.get_mut(self.active) {
                 // Accepted as-is, so stop asking about *this* change: the
                 // stamp is moved up to what is on disk now, and the next
                 // external edit raises the banner again. Saving will still
@@ -1409,6 +1420,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn closing_before_a_middle_tab_keeps_the_selected_file() {
+        let dir = std::env::temp_dir().join("snor_editor_middle_close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ed = Editor::new();
+        for i in 0..4 {
+            let path = dir.join(format!("{i}.txt"));
+            std::fs::write(&path, "text").unwrap();
+            ed.open_file(path);
+        }
+        ed.active = 1;
+        let selected = ed.tabs[1].path.clone();
+        ed.close_tab(0);
+        assert_eq!(ed.tabs[ed.active].path, selected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saving_refuses_to_overwrite_an_existing_temp_sibling() {
+        let dir = std::env::temp_dir().join("snor_editor_temp_collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut buf = OpenBuffer::open(path.clone()).unwrap();
+        buf.text = "edited".into();
+        buf.dirty = true;
+        let tmp = temp_sibling(&path);
+        std::fs::write(&tmp, "unrelated contents").unwrap();
+        assert!(buf.save().is_err());
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "unrelated contents");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        assert!(buf.dirty);
+        std::fs::remove_file(tmp).unwrap();
+        buf.save().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "edited");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn open_edit_save_roundtrip() {
         let dir = std::env::temp_dir().join("snor_editor_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1541,7 +1590,10 @@ mod tests {
         ed.reconcile_with_disk();
         assert_eq!(ed.tabs[0].text, "fn a() {}\nfn b() {}\n");
         assert!(!ed.tabs[0].dirty);
-        assert!(ed.tabs[0].line_count() >= 2, "line count must follow the text");
+        assert!(
+            ed.tabs[0].line_count() >= 2,
+            "line count must follow the text"
+        );
         assert!(
             ed.note.as_ref().is_some_and(|(t, _)| t.contains("lib.rs")),
             "a silent reload reads as a bug; the note is the receipt"
@@ -1573,7 +1625,10 @@ mod tests {
         std::fs::write(&path, "fn main() {}\n// agent\n").unwrap();
         ed.reconcile_with_disk();
 
-        assert!(ed.tabs[0].conflict, "a dirty buffer must report, not reload");
+        assert!(
+            ed.tabs[0].conflict,
+            "a dirty buffer must report, not reload"
+        );
         assert!(
             ed.tabs[0].text.contains("// mine") && !ed.tabs[0].text.contains("// agent"),
             "the user's edits must survive the check untouched"
@@ -1585,7 +1640,10 @@ mod tests {
         ed.save_active();
         assert!(!ed.tabs[0].conflict);
         ed.reconcile_with_disk();
-        assert!(!ed.tabs[0].conflict, "the banner must not re-raise on our own save");
+        assert!(
+            !ed.tabs[0].conflict,
+            "the banner must not re-raise on our own save"
+        );
         assert!(std::fs::read_to_string(&path).unwrap().contains("// mine"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1617,7 +1675,10 @@ mod tests {
 
         // "discard" is the only path that removes it.
         ed.pending_close = None;
-        assert!(!ed.close_tab(0), "the last tab still reports the empty list");
+        assert!(
+            !ed.close_tab(0),
+            "the last tab still reports the empty list"
+        );
         assert!(!ed.has_unsaved());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1635,7 +1696,10 @@ mod tests {
 
         let mut ed = Editor::new();
         ed.open_file(path.clone());
-        assert!(ed.tabs.is_empty(), "a binary file must not open as a buffer");
+        assert!(
+            ed.tabs.is_empty(),
+            "a binary file must not open as a buffer"
+        );
         assert!(ed.error.is_some(), "and the refusal must be reported");
         assert_eq!(
             std::fs::read(&path).unwrap(),
