@@ -244,7 +244,16 @@ pub struct FileNode {
 }
 
 fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
-    if depth > 8 {
+    build_nodes_with_budget(dir, depth, show_hidden, &mut 2000)
+}
+
+fn build_nodes_with_budget(
+    dir: &Path,
+    depth: usize,
+    show_hidden: bool,
+    remaining: &mut usize,
+) -> Vec<FileNode> {
+    if depth > 8 || *remaining == 0 {
         return Vec::new();
     }
     let entries = match std::fs::read_dir(dir) {
@@ -254,6 +263,9 @@ fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
+        if *remaining == 0 {
+            break;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if name == ".git" {
             continue;
@@ -268,22 +280,20 @@ fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
             continue;
         }
         let path = entry.path();
+        // Reserve the parent before descending so every listed entry counts.
+        *remaining -= 1;
         // `is_dir` follows the link so the row still reads as a folder, but the
         // recursion must not: a directory symlink pointing at an ancestor (or at
         // a sibling tree) walks the same directory twice, and a cyclic pair would
         // spend the whole 2000-entry budget re-expanding folders the user never
         // opened. The link is listed; only its contents are skipped.
         let is_dir = path.is_dir();
-        let is_link_dir = is_dir
-            && entry
-                .file_type()
-                .map(|t| t.is_symlink())
-                .unwrap_or(false);
+        let is_link_dir = is_dir && entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
         if is_dir {
             let children = if is_link_dir {
                 Vec::new()
             } else {
-                build_nodes(&path, depth + 1, show_hidden)
+                build_nodes_with_budget(&path, depth + 1, show_hidden, remaining)
             };
             dirs.push(FileNode {
                 path,
@@ -298,9 +308,6 @@ fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
                 is_dir: false,
                 children: Vec::new(),
             });
-        }
-        if dirs.len() + files.len() > 2000 {
-            break;
         }
     }
     dirs.sort_by_key(|a| a.name.to_lowercase());
@@ -571,8 +578,14 @@ impl FileTree {
             return;
         }
         let res = match self.create_mode {
-            Some(CreateMode::Dir) => std::fs::create_dir_all(&target),
-            _ => std::fs::write(&target, ""),
+            Some(CreateMode::Dir) => std::fs::create_dir(&target),
+            // Existence checks race with shells and agents creating files.
+            // Exclusive creation also refuses dangling symlinks.
+            _ => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map(|_| ()),
         };
         match res {
             Ok(()) => {
@@ -1104,16 +1117,60 @@ impl FileTree {
 mod tests {
     use super::*;
 
+    #[test]
+    fn entry_budget_is_shared_by_nested_folders() {
+        let dir = std::env::temp_dir().join(format!("snor-tree-budget-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("{i}.txt")), "x").unwrap();
+            std::fs::write(dir.join("nested").join(format!("{i}.txt")), "x").unwrap();
+        }
+        fn count(nodes: &[FileNode]) -> usize {
+            nodes.iter().map(|n| 1 + count(&n.children)).sum()
+        }
+        let mut budget = 4;
+        let nodes = build_nodes_with_budget(&dir, 0, false, &mut budget);
+        assert_eq!(count(&nodes), 4);
+        assert_eq!(budget, 0);
+        assert!(build_nodes_with_budget(&dir, 0, false, &mut budget).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creating_a_file_refuses_a_dangling_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("snor-tree-create-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("missing.txt");
+        let link = dir.join("link.txt");
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        let mut tree = FileTree::empty();
+        tree.begin_create(dir.clone(), CreateMode::File);
+        tree.create_name = "link.txt".into();
+        tree.do_create();
+        assert!(tree.error.is_some());
+        assert!(!target.exists(), "creation must not follow a dangling link");
+        assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The first-run screen depends on this: no folder means no listing, and —
     /// the part that costs something every frame — no recursive watch on a
     /// directory the app is not even showing.
     #[test]
     fn a_tree_with_no_folder_lists_nothing_and_watches_nothing() {
         let tree = FileTree::empty();
-        assert!(tree.root.as_os_str().is_empty(), "an empty tree has no root");
+        assert!(
+            tree.root.as_os_str().is_empty(),
+            "an empty tree has no root"
+        );
         assert!(tree.nodes.is_empty(), "nothing to list");
         assert!(tree.expanded.is_empty(), "nothing expanded");
-        assert!(tree._watcher.is_none(), "no folder means no recursive watch");
+        assert!(
+            tree._watcher.is_none(),
+            "no folder means no recursive watch"
+        );
     }
 
     /// The first-run screen's tree has no watcher, so this is the path that has
