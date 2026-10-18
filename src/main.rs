@@ -4,6 +4,7 @@
 use eframe::egui;
 
 mod app;
+mod app_icon;
 mod brightness;
 mod dim;
 mod editor;
@@ -22,6 +23,7 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("Snor")
+            .with_icon(app_icon::data())
             .with_min_inner_size([900.0, 600.0])
             // The reference is a decorationless window that draws its own
             // frame and its own minimise / maximise / close. Turning the OS

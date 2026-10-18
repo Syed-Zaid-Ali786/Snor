@@ -4,6 +4,9 @@
 use eframe::egui;
 use snor_installer::app::{Launch, SetupApp};
 
+#[path = "../../src/app_icon.rs"]
+mod app_icon;
+
 fn main() -> anyhow::Result<()> {
     // Which mode this binary is in is decided before the window exists: the
     // uninstaller is a copy of this file, told apart by what sits beside it
@@ -14,6 +17,7 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 460.0])
             .with_title(title)
+            .with_icon(app_icon::data())
             // Undecorated, like the app: the title bar, its controls and the
             // window's own edge are all drawn by `SetupApp` off the shared
             // palette. The window is fixed-size — there is no maximise to
