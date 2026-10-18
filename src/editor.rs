@@ -411,6 +411,9 @@ fn temp_sibling(path: &Path) -> PathBuf {
 }
 
 pub struct OpenBuffer {
+    // egui stores undo and cursor state by widget id. Give each open buffer a
+    // fresh identity, including when a discarded file is opened again.
+    text_id: egui::Id,
     pub path: PathBuf,
     pub lang: String,
     pub text: String,
@@ -454,6 +457,14 @@ impl OpenBuffer {
         let lang = language_for(&path).to_string();
         let lines = ropey::Rope::from_str(&text).len_lines();
         Ok(Self {
+            text_id: {
+                static NEXT_BUFFER_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                egui::Id::new((
+                    "snor_editor_text",
+                    NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ))
+            },
             stamp: disk_stamp(&path),
             path,
             lang,
@@ -635,12 +646,14 @@ impl Editor {
         let path = canonical_for_open(path);
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
             self.active = idx;
+            self.recompute_find();
             return;
         }
         match OpenBuffer::open(path) {
             Ok(buf) => {
                 self.tabs.push(buf);
                 self.active = self.tabs.len() - 1;
+                self.recompute_find();
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -663,6 +676,15 @@ impl Editor {
             return !self.tabs.is_empty();
         }
         self.tabs.remove(idx);
+        // The confirmation is a non-modal window: another tab can be closed
+        // while it is open. Keep its index attached to the original buffer.
+        self.pending_close = self.pending_close.and_then(|pending| {
+            if pending == idx {
+                None
+            } else {
+                Some(pending - usize::from(pending > idx))
+            }
+        });
         if idx < self.active {
             self.active -= 1;
         }
@@ -676,11 +698,13 @@ impl Editor {
             // the closed file's last cursor position indefinitely.
             self.cursor_line = 1;
             self.cursor_col = 1;
+            self.recompute_find();
             return false;
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.recompute_find();
         true
     }
 
@@ -744,6 +768,7 @@ impl Editor {
     /// agent truncates and rewrites, we may catch the empty middle, and the next
     /// tick sees a stamp that moved again and reloads the finished version.
     fn reconcile_with_disk(&mut self) {
+        let mut active_reloaded = false;
         for i in 0..self.tabs.len() {
             let Some(stamp) = disk_stamp(&self.tabs[i].path) else {
                 continue;
@@ -756,9 +781,13 @@ impl Editor {
                 continue;
             }
             if self.tabs[i].reload() {
+                active_reloaded |= i == self.active;
                 let name = self.tabs[i].name();
                 self.note = Some((format!("reloaded {name}"), std::time::Instant::now()));
             }
+        }
+        if active_reloaded {
+            self.recompute_find();
         }
     }
 
@@ -971,13 +1000,15 @@ impl Editor {
         let Some(&line) = self.find_hits.get(self.find_pos) else {
             return;
         };
-        let mut byte: usize = buf.text.lines().take(line).map(|l| l.len() + 1).sum();
-        byte = byte.min(buf.text.len());
-        while byte > 0 && !buf.text.is_char_boundary(byte) {
-            byte -= 1;
-        }
-        let ch = buf.text.get(..byte).map(|s| s.chars().count()).unwrap_or(0);
-        let id = ui.make_persistent_id("snor_editor_text");
+        // `lines()` strips CRLF terminators, so adding one per line loses a
+        // character for every Windows newline before the hit.
+        let ch: usize = buf
+            .text
+            .split_inclusive('\n')
+            .take(line)
+            .map(|part| part.chars().count())
+            .sum();
+        let id = buf.text_id;
         let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
         state
             .cursor
@@ -1270,6 +1301,7 @@ impl Editor {
                 && let Some(buf) = self.tabs.get_mut(self.active)
                 && buf.reload()
             {
+                self.recompute_find();
                 let name = self.tabs[self.active].name();
                 self.note = Some((format!("reloaded {name}"), std::time::Instant::now()));
             }
@@ -1301,7 +1333,7 @@ impl Editor {
         let lang = buf.lang.clone();
         let editable = !buf.too_large;
         let line_count = buf.line_count();
-        let editor_id = ui.make_persistent_id("snor_editor_text");
+        let editor_id = buf.text_id;
         let mut text_changed = false;
         // Read once, before the closures below. `buf` holds a mutable borrow of
         // `self.tabs`, so `self` cannot be asked for these later — and the
@@ -1418,6 +1450,137 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_jumps_to_the_actual_line_start_with_crlf_and_unicode() {
+        let dir = std::env::temp_dir().join("snor_find_crlf_regression");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("windows.txt");
+        let text = "caf\u{e9}\r\nsecond\r\nneedle\n";
+        std::fs::write(&path, text).unwrap();
+        let mut ed = Editor::new();
+        ed.open_file(path);
+        ed.find_query = "needle".into();
+        ed.recompute_find();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ed.jump_to_hit(ui);
+            let id = ui.memory(|m| m.focused()).unwrap();
+            let state = egui::widgets::text_edit::TextEditState::load(&ctx, id).unwrap();
+            assert_eq!(
+                state.cursor.char_range().unwrap().primary.index.0,
+                text[..text.find("needle").unwrap()].chars().count()
+            );
+        });
+        output.textures_delta.clear();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_closing_and_reloading_files_refreshes_find() {
+        let dir = std::env::temp_dir().join("snor_find_lifecycle_regression");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&first, "needle\n").unwrap();
+        std::fs::write(&second, "plain\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open_file(first.clone());
+        ed.find_open = true;
+        ed.find_query = "needle".into();
+        ed.recompute_find();
+        ed.open_file(second);
+        assert!(
+            ed.find_hits.is_empty(),
+            "new tab kept another file's matches"
+        );
+        ed.open_file(first.clone());
+        assert_eq!(ed.find_hits, vec![0], "existing-tab open did not refresh");
+        std::fs::write(first, "plain\nneedle\nneedle\n").unwrap();
+        ed.reconcile_with_disk();
+        assert_eq!(ed.find_hits, vec![1, 2], "reload left stale line numbers");
+        ed.close_tab(0);
+        assert!(
+            ed.find_hits.is_empty(),
+            "close left the removed file's matches"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closing_an_earlier_tab_keeps_the_pending_close_on_its_file() {
+        let dir = std::env::temp_dir().join("snor_pending_close_regression");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ed = Editor::new();
+        for i in 0..3 {
+            let path = dir.join(format!("{i}.txt"));
+            std::fs::write(&path, "text").unwrap();
+            ed.open_file(path);
+        }
+        ed.tabs[1].dirty = true;
+        let pending_path = ed.tabs[1].path.clone();
+        ed.request_close_tab(1);
+        ed.close_tab(0);
+        assert_eq!(ed.pending_close, Some(0));
+        assert_eq!(ed.tabs[ed.pending_close.unwrap()].path, pending_path);
+        ed.close_tab(0);
+        assert_eq!(ed.pending_close, None, "removed tab left a dangling prompt");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn undo_history_does_not_cross_buffers_or_survive_reopening() {
+        use egui::text::{CCursor, CCursorRange};
+        use egui::widgets::text_edit::TextEditState;
+        let dir = std::env::temp_dir().join("snor_undo_isolation_regression");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&first, "needle first").unwrap();
+        std::fs::write(&second, "needle second").unwrap();
+        let mut ed = Editor::new();
+        ed.open_file(first.clone());
+        ed.find_query = "needle".into();
+        ed.recompute_find();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ed.jump_to_hit(ui);
+            let first_id = ui.memory(|m| m.focused()).unwrap();
+            let cursor = CCursorRange::one(CCursor::new(0));
+            let mut state = TextEditState::load(&ctx, first_id).unwrap();
+            let mut undoer = state.undoer();
+            undoer.add_undo(&(cursor, "private first-file contents".into()));
+            state.set_undoer(undoer);
+            state.store(&ctx, first_id);
+            ed.open_file(second.clone());
+            ed.recompute_find();
+            ed.jump_to_hit(ui);
+            let second_id = ui.memory(|m| m.focused()).unwrap();
+            let second_state = TextEditState::load(&ctx, second_id).unwrap();
+            assert!(
+                second_state
+                    .undoer()
+                    .undo(&(cursor, ed.tabs[1].text.clone()))
+                    .is_none(),
+                "undo in a different file exposed the first file's contents"
+            );
+            ed.close_tab(0);
+            ed.open_file(first.clone());
+            ed.recompute_find();
+            ed.jump_to_hit(ui);
+            let reopened_id = ui.memory(|m| m.focused()).unwrap();
+            let reopened = TextEditState::load(&ctx, reopened_id).unwrap();
+            assert!(
+                reopened
+                    .undoer()
+                    .undo(&(cursor, ed.tabs[1].text.clone()))
+                    .is_none(),
+                "reopening a file revived its discarded undo history"
+            );
+        });
+        output.textures_delta.clear();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn closing_before_a_middle_tab_keeps_the_selected_file() {

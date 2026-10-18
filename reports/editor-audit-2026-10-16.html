@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snor — Editor bug audit</title>
+  <style>
+    @font-face{font-family:Space;src:url('../assets/fonts/SpaceGrotesk-Regular.ttf') format('truetype');font-display:swap}
+    @font-face{font-family:Space;src:url('../assets/fonts/SpaceGrotesk-Bold.ttf') format('truetype');font-weight:700;font-display:swap}
+    :root{--paper:#e9efeb;--panel:#f9fbf9;--forest:#213f35;--ink:#20392f;--muted:#50685d;--line:#c5d3c9;--sage:#c4d7b3;--copper:#8b472f}
+    *{box-sizing:border-box}body{margin:0;padding:36px 24px;background:var(--paper);color:var(--ink);font:15px/1.55 'Segoe UI',sans-serif}main{max-width:1080px;margin:auto}
+    header,footer,.status{display:flex;justify-content:space-between;align-items:center;gap:16px}.brand,h1,h2{font-family:Space,sans-serif}.brand{font-weight:700;font-size:25px;letter-spacing:-1px}.utility,code,time,.severity{font:12px/1.5 Consolas,monospace}.utility{color:var(--muted)}.branch{padding:7px 14px;border:1px solid var(--forest);border-radius:24px;color:var(--forest)}
+    .hero{display:grid;grid-template-columns:1.35fr 1fr;align-items:center;gap:36px;padding:38px 40px;margin:22px 0;background:var(--forest);color:var(--panel);border-radius:18px}.eyebrow{font:11px Consolas,monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--sage)}h1{font-size:clamp(34px,4.6vw,54px);line-height:1.08;letter-spacing:-.055em;margin:15px 0} .intro{color:#d8e3d9;max-width:420px;margin:0;line-height:1.6}
+    .buffer-map{padding:20px;border:1px solid #62816f;border-radius:10px}.buffer-map figcaption{font:11px Consolas,monospace;color:var(--sage);margin-bottom:15px;letter-spacing:.08em;text-transform:uppercase}.buffer-lane{display:grid;grid-template-columns:100px 1fr;align-items:center;gap:14px}.buffer-lane+.buffer-lane{margin-top:12px}.file-tab{font:12px Consolas,monospace;padding:8px 12px;background:var(--sage);color:var(--forest);border-radius:6px 6px 0 0}.history{font:11px Consolas,monospace;color:#e2ebe1;border-left:2px solid var(--sage);padding-left:12px}.history span{display:block;color:#b3c9b8;font-size:10px}
+    .section-label{font-size:12px;color:var(--muted);margin:26px 0 12px;letter-spacing:.06em;text-transform:uppercase}.fixes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}article{padding:24px 26px;background:var(--panel);border:1px solid var(--line);border-radius:12px}.severity{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--copper)}.severity.medium{color:var(--muted)}h2{font-size:23px;letter-spacing:-.035em;line-height:1.2;margin:12px 0}p{margin:9px 0;color:var(--muted)}strong{color:var(--ink);font-weight:600}.result{margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:13px}.result strong{color:var(--forest)}
+    .status{margin-top:20px;padding:16px 20px;background:#d5e2d5;border-radius:9px;flex-wrap:wrap;font-size:13px}.status strong{font-family:Space,sans-serif;font-size:16px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--forest);margin-right:8px}.commands{margin:13px 0 0;font-size:11px;overflow-wrap:anywhere}.commands code{font-size:11px}footer{padding-top:17px;margin-top:20px;border-top:1px solid var(--line);font-size:11px;color:var(--muted)}a{color:inherit;text-underline-offset:3px}a:focus-visible{outline:2px solid var(--copper);outline-offset:4px}
+    @media(max-width:720px){body{padding:22px 16px}.hero{grid-template-columns:1fr;padding:28px;gap:22px}.buffer-map{margin:0}.fixes{grid-template-columns:1fr}article{padding:22px}.status,footer{align-items:flex-start;flex-direction:column;gap:8px}}
+    @media print{body{padding:0;font-size:12px}.hero{padding:24px;margin:14px 0}h1{font-size:36px}article{padding:16px;break-inside:avoid}.hero,.status,.file-tab{print-color-adjust:exact;-webkit-print-color-adjust:exact}footer{margin-top:12px}}
+  </style>
+</head>
+<body>
+  <main>
+    <header><span class="brand">snor / engineering</span><span class="utility branch">branch: dev</span></header>
+    <section class="hero" aria-labelledby="title">
+      <div><div class="eyebrow">Editor bug audit · 16 October 2026</div><h1>Every file.<br>Its own history.</h1><p class="intro">Four reproduced bugs fixed. Each regression failed before repair and passes afterward.</p></div>
+      <figure class="buffer-map" aria-label="Each file now keeps separate undo and cursor state">
+        <figcaption>Buffer state / isolated</figcaption>
+        <div class="buffer-lane"><span class="file-tab">main.rs</span><span class="history">Own undo history<span>Own cursor position</span></span></div>
+        <div class="buffer-lane"><span class="file-tab">lib.rs</span><span class="history">Own undo history<span>Own cursor position</span></span></div>
+      </figure>
+    </section>
+    <div class="section-label">Findings resolved · <a href="../src/editor.rs">src/editor.rs</a></div>
+    <section class="fixes" aria-label="Bug fixes">
+      <article><span class="severity">High · buffer integrity</span><h2>Undo stays in its file</h2><p>Shared widget state let undo bring another tab’s text into the current file.</p><p class="result"><strong>Fixed:</strong> Each open buffer has a fresh identity for undo and cursor state, including after reopening.</p></article>
+      <article><span class="severity">High · unsaved changes</span><h2>Close the intended tab</h2><p>Closing an earlier tab could redirect a pending save/discard prompt to another file.</p><p class="result"><strong>Fixed:</strong> The pending prompt follows its original buffer and clears when that buffer closes.</p></article>
+      <article><span class="severity medium">Medium · Find navigation</span><h2>Land on the right line</h2><p>Find undercounted Windows CRLF newlines, placing the cursor before its target.</p><p class="result"><strong>Fixed:</strong> Navigation counts complete line endings and Unicode characters.</p></article>
+      <article><span class="severity medium">Medium · Find results</span><h2>Keep matches current</h2><p>Opening, closing or reloading files could leave another version’s search results visible.</p><p class="result"><strong>Fixed:</strong> Results refresh across buffer changes and automatic or manual reloads.</p></article>
+    </section>
+    <section class="status" aria-label="Validation results"><strong><span class="dot" aria-hidden="true"></span>165 workspace tests passed</strong><span>4 new regression tests</span><span>Clippy: zero warnings</span></section>
+    <p class="commands"><code>cargo test --workspace</code> · <code>cargo clippy --workspace --all-targets -- -D warnings</code> · <code>git diff --check</code></p>
+    <footer><span>App + installer checked. State-level validation; no live GUI verification.</span><span>Prepared on dev · no new dependencies</span></footer>
+  </main>
+</body>
+</html>
