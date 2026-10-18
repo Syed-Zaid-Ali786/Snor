@@ -25,6 +25,19 @@ const TREE_MAX_W: f32 = 520.0;
 /// Half-width of the explorer's resize grip.
 const TREE_GRAB: f32 = 5.0;
 
+/// Compare terminal observations, not the explorer's root: a manual folder
+/// choice survives repeated prompts until a shell really moves or focus changes.
+fn context_changed(previous: &mut Option<(u64, PathBuf)>, id: u64, cwd: &std::path::Path) -> bool {
+    if previous
+        .as_ref()
+        .is_some_and(|(old_id, old_cwd)| *old_id == id && old_cwd == cwd)
+    {
+        return false;
+    }
+    *previous = Some((id, cwd.to_path_buf()));
+    true
+}
+
 // --- Window placement --------------------------------------------------
 /// Room left at the bottom of the monitor for the taskbar when deciding how
 /// tall a floating window may be.
@@ -204,11 +217,9 @@ pub struct SnorApp {
     /// Explorer width, driven by our own grip rather than egui's built-in
     /// panel resize. See [`SnorApp::tree_grip`] for why.
     tree_w: f32,
-    /// Session whose directory the explorer is currently showing. Auto context
-    /// switching keys on a *change* of this, not on the directories differing
-    /// — see [`SnorApp::sync_context_root`] for why that distinction is the
-    /// whole design.
-    ctx_session: Option<u64>,
+    /// Last observed session and directory. Comparing observations lets cd
+    /// update the tree while leaving a manually chosen root alone otherwise.
+    ctx_session: Option<(u64, PathBuf)>,
     /// Was the window maximised when F11 was pressed? Entering fullscreen
     /// deliberately restores the window first (see the F11 handler), so
     /// leaving it has to put the maximise back by hand — winit can only
@@ -1510,21 +1521,10 @@ impl SnorApp {
     /// terminal you are typing into belongs to. Works in both modes — the
     /// focused pane in Flow Mode, the active tab otherwise.
     ///
-    /// **It fires on a change of focus, not on the directories differing.**
-    /// That distinction is the whole design. Comparing directories every frame
-    /// would fight the user: pick a folder from the header's dialog and the
-    /// very next frame would put the focused shell's directory back, leaving
-    /// the dialog unable to do anything while any terminal is open. Keying on
-    /// the session id means a manual choice survives until focus actually
-    /// moves, which is what "switch context when I move to another terminal"
-    /// is supposed to mean.
-    ///
-    /// The limit worth knowing: `session.cwd` is the directory a shell was
-    /// *spawned* in, not one it has `cd`-ed into since. Nothing in this app
-    /// reads the shell's own output, so a pane that changes directory by hand
-    /// keeps the directory it started with, and the explorer will not follow
-    /// it. Following a `cd` needs OSC 7 emitted by the shell and parsed in
-    /// `terminal.rs`, which PowerShell does not do by default.
+    /// Follow a new session or a newly reported directory in the same session.
+    /// Compare against the last terminal observation, never against the tree:
+    /// a manual folder choice survives unchanged prompts and ordinary frames.
+    /// Directory reports come from shell prompt hooks or OSC 7 / OSC 9;9.
     fn sync_context_root(&mut self) {
         // The setting is honoured here rather than by not drawing the explorer:
         // the tree still follows a manual re-root from the header's dialog, and
@@ -1545,10 +1545,9 @@ impl SnorApp {
         let Some((id, cwd)) = self.terminal.context_session(self.flow) else {
             return;
         };
-        if self.ctx_session == Some(id) {
+        if !context_changed(&mut self.ctx_session, id, &cwd) {
             return;
         }
-        self.ctx_session = Some(id);
         if cwd != self.tree.root {
             self.tree.set_root(cwd);
         }
@@ -2016,6 +2015,21 @@ impl Drop for SnorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_tracks_focus_and_cd_without_overriding_a_manual_root_every_frame() {
+        let a = PathBuf::from(r"C:\Projects\One");
+        let b = PathBuf::from(r"D:\Outside\Two");
+        let mut previous = None;
+        assert!(context_changed(&mut previous, 1, &a));
+        // A folder picked manually is not an input to the observation. An
+        // unchanged prompt leaves it alone, even on the next frame.
+        assert!(!context_changed(&mut previous, 1, &a));
+        assert!(context_changed(&mut previous, 1, &b));
+        assert!(!context_changed(&mut previous, 1, &b));
+        assert!(context_changed(&mut previous, 2, &a));
+        assert!(context_changed(&mut previous, 1, &b));
+    }
 
     /// A real directory for a test that needs one to exist, named after the
     /// process so two runs (or two crates) cannot collide on it.

@@ -165,11 +165,61 @@ fn shell_title(n: usize, shell: ShellKind) -> String {
 struct Notifications {
     bell: bool,
     title: Option<String>,
+    cwd: Option<PathBuf>,
+    shell_prompt: bool,
 }
 
-/// Longest tail kept for a sequence split across two reads. An OSC title is
-/// short; anything longer than this was not a title.
-const NOTIF_TAIL_MAX: usize = 512;
+/// Bound incomplete OSC data while allowing long Windows directory reports.
+const NOTIF_TAIL_MAX: usize = 32_768;
+
+/// Directory reports are control sequences, never guessed from prompt text.
+/// OSC 9;9 carries a native Windows path; OSC 7 carries a percent-encoded URI.
+/// Native Windows shells use a reserved title prefix because ConPTY drops
+/// unknown OSCs, and Windows PowerShell does not enable VT output by default.
+fn reported_directory(ps: &str, pt: &str) -> Option<PathBuf> {
+    let path = match ps {
+        "9" => pt.strip_prefix("9;")?.trim_matches('"').to_owned(),
+        "0" | "2" => pt.strip_prefix("snor-cwd;")?.to_owned(),
+        "7" => {
+            let uri = pt.strip_prefix("file://")?;
+            let (host, encoded) = uri.split_once('/')?;
+            let mut bytes = Vec::new();
+            let mut chars = encoded.bytes();
+            while let Some(byte) = chars.next() {
+                bytes.push(if byte == b'%' {
+                    let hi = (chars.next()? as char).to_digit(16)?;
+                    let lo = (chars.next()? as char).to_digit(16)?;
+                    ((hi << 4) | lo) as u8
+                } else {
+                    byte
+                });
+            }
+            let decoded = String::from_utf8(bytes).ok()?;
+            if decoded.as_bytes().get(1) == Some(&b':') {
+                decoded
+            } else if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+                format!("/{decoded}")
+            } else {
+                // Linux paths from WSL are not local Windows paths. Do not
+                // invent a drive or start a process to translate every prompt.
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let path = PathBuf::from(path);
+    (path.is_absolute()
+        && !path
+            .as_os_str()
+            .to_string_lossy()
+            .contains(['\0', '\r', '\n']))
+    .then_some(path)
+}
+
+/// Run at each prompt, so cd/Set-Location/Pop-Location all report the same way.
+/// Keep the original prompt and the native exit status intact. No profile or
+/// settings file on the user's machine is modified.
+const POWERSHELL_CWD_INIT: &str = r#"$global:SnorOriginalPrompt = $function:prompt; function global:prompt { $snorExit = $global:LASTEXITCODE; if ($PWD.Provider.Name -eq 'FileSystem') { $Host.UI.RawUI.WindowTitle = 'snor-cwd;' + $PWD.ProviderPath }; & $global:SnorOriginalPrompt; $global:LASTEXITCODE = $snorExit }"#;
 
 /// Read a chunk for bells and title assignments, holding an unterminated
 /// escape in `tail` for the next chunk.
@@ -230,9 +280,16 @@ fn scan_notifications(tail: &mut Vec<u8>, chunk: &[u8]) -> Notifications {
         // sequence for a terminal emulator feature this app does not implement.
         if let Some((ps, pt)) = payload.split_once(';')
             && matches!(ps, "0" | "1" | "2")
+            && !pt.starts_with("snor-cwd;")
             && !pt.trim().is_empty()
         {
             out.title = Some(pt.to_string());
+        }
+        if let Some((ps, pt)) = payload.split_once(';')
+            && let Some(cwd) = reported_directory(ps, pt)
+        {
+            out.cwd = Some(cwd);
+            out.shell_prompt |= matches!(ps, "0" | "2") && pt.starts_with("snor-cwd;");
         }
         i = resume;
     }
@@ -394,6 +451,8 @@ enum WheelIntent {
     None,
     /// Rows to move through history, positive for older output.
     Scroll(i32),
+    /// Rows to report to an application that has enabled terminal mouse input.
+    MouseWheel(i32),
     /// A zoom factor to multiply by, straight from egui's own gesture handling.
     Zoom(f32),
 }
@@ -410,6 +469,7 @@ fn wheel_intent(
     rect: eframe::egui::Rect,
     cell_h: f32,
     view: &mut ViewState,
+    mouse_capture: bool,
 ) -> WheelIntent {
     if !ui.rect_contains_pointer(rect) {
         return WheelIntent::None;
@@ -431,7 +491,58 @@ fn wheel_intent(
     if rows == 0.0 {
         return WheelIntent::None;
     }
-    WheelIntent::Scroll(rows as i32)
+    if mouse_capture {
+        WheelIntent::MouseWheel(rows as i32)
+    } else {
+        WheelIntent::Scroll(rows as i32)
+    }
+}
+
+/// Encode a vertical wheel gesture using the mouse protocol requested by the
+/// running terminal app. Position is zero-based `(row, column)` in the grid.
+fn mouse_wheel_bytes(
+    delta_rows: i32,
+    position: (u16, u16),
+    size: (u16, u16),
+    encoding: vt100::MouseProtocolEncoding,
+    modifiers: eframe::egui::Modifiers,
+) -> Vec<u8> {
+    let (rows, cols) = size;
+    if delta_rows == 0 || rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let row = position.0.min(rows - 1) + 1;
+    let col = position.1.min(cols - 1) + 1;
+    let modifier_bits = (if modifiers.shift { 4u16 } else { 0 })
+        + (if modifiers.alt { 8u16 } else { 0 })
+        + (if modifiers.ctrl { 16u16 } else { 0 });
+    let button = (if delta_rows > 0 { 64u16 } else { 65u16 }) + modifier_bits;
+    let count = delta_rows.unsigned_abs().min(32);
+    let mut out = Vec::with_capacity(count as usize * 24);
+    for _ in 0..count {
+        match encoding {
+            vt100::MouseProtocolEncoding::Sgr => {
+                out.extend_from_slice(format!("\x1b[<{button};{col};{row}M").as_bytes());
+            }
+            vt100::MouseProtocolEncoding::Utf8 => {
+                out.extend_from_slice(b"\x1b[M");
+                for value in [button + 32, col + 32, row + 32] {
+                    let mut buf = [0; 4];
+                    let ch = char::from_u32(value as u32).unwrap_or('\u{fffd}');
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            vt100::MouseProtocolEncoding::Default => {
+                // The original X10 encoding stores each coordinate in one
+                // byte, leaving 223 usable one-based cells after its +32 bias.
+                out.extend_from_slice(b"\x1b[M");
+                out.push((button + 32) as u8);
+                out.push((col.min(223) + 32) as u8);
+                out.push((row.min(223) + 32) as u8);
+            }
+        }
+    }
+    out
 }
 
 /// Which cell of a grid the pointer is over, if it is over one at all.
@@ -809,9 +920,8 @@ struct Session {
     /// hold this id instead, so closing or adding a shell cannot strand a
     /// pane on the wrong session when the vec shifts.
     id: u64,
-    /// Working directory the shell was spawned in. A pane created from
-    /// another inherits its cwd, so each agent keeps its own project root
-    /// and the focused pane can offer it back to the explorer.
+    /// Latest reported working directory, initially the spawn directory.
+    /// Inherited by new panes and offered to the explorer on focus or cd.
     cwd: PathBuf,
     /// Tab label. The first shell is just "powershell"; later ones are
     /// numbered from 2, so a single tab never reads "powershell 1".
@@ -1457,6 +1567,27 @@ impl Session {
         };
         let mut cmd = CommandBuilder::new(self.shell.program());
         cmd.args(self.shell.args());
+        match self.shell {
+            ShellKind::PowerShell | ShellKind::Pwsh => {
+                cmd.args(["-Command", POWERSHELL_CWD_INIT]);
+            }
+            ShellKind::Cmd => {
+                let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "$P$G".into());
+                cmd.env("PROMPT", format!("$E]0;snor-cwd;$P$E\\{prompt}"));
+            }
+            ShellKind::GitBash => {
+                // Git Bash's pwd -W emits a native Windows path.
+                let previous = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+                cmd.env(
+                    "PROMPT_COMMAND",
+                    format!(
+                        r#"{previous}{}printf '\033]0;snor-cwd;%s\007' "$(pwd -W)""#,
+                        if previous.is_empty() { "" } else { "; " }
+                    ),
+                );
+            }
+            ShellKind::Wsl => {}
+        }
         cmd.cwd(cwd);
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -1506,6 +1637,28 @@ impl Session {
         // Typing means the user is done reading history: a shell whose output you
         // cannot see must not be the one you are typing into.
         self.scroll_to_bottom();
+        self.write_bytes(bytes);
+    }
+
+    /// Send a mouse report without changing the terminal's scrollback position.
+    fn send_mouse_wheel(
+        &mut self,
+        delta_rows: i32,
+        position: (u16, u16),
+        modifiers: eframe::egui::Modifiers,
+    ) {
+        let screen = self.parser.screen();
+        let bytes = mouse_wheel_bytes(
+            delta_rows,
+            position,
+            screen.size(),
+            screen.mouse_protocol_encoding(),
+            modifiers,
+        );
+        self.write_bytes(&bytes);
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
         if let Some(w) = self.writer.as_mut()
             && let Err(e) = w.write_all(bytes).and_then(|_| w.flush())
         {
@@ -1744,6 +1897,20 @@ impl Session {
         // attention flag arrive from a tab that is in the background — the whole
         // point of the flag.
         let notes = scan_notifications(&mut self.notif_tail, chunk);
+        // A native prompt report may replace the shell's startup title before
+        // ConPTY flushes it. Treat it as the introduction so the first later
+        // agent title still raises attention and appears in the pane header.
+        if notes.shell_prompt && self.first_title.is_none() && notes.title.is_none() {
+            let startup = self.shell.label().to_owned();
+            self.first_title = Some(startup.clone());
+            self.last_title = Some(startup);
+        }
+        if let Some(cwd) = notes.cwd
+            && cwd != self.cwd
+            && cwd.is_dir()
+        {
+            self.cwd = cwd;
+        }
         if notes.bell {
             self.attention = true;
         }
@@ -2186,14 +2353,27 @@ impl Terminal {
         if let Some(session) = self.session_mut() {
             session.apply_size(rows, cols);
         }
-        // Wheel over the grid reads history, or zooms the text with Ctrl held.
-        // Neither is the shell's business, and neither existed before this:
-        // the grid used to sit in a `ScrollArea` whose content was exactly one
-        // screenful, so scrolling it moved nothing at all.
-        match wheel_intent(ui, grid_rect, cell.1, &mut self.view) {
+        // Wheel over the grid reads history unless the shell has asked for
+        // mouse input, in which case the gesture belongs to its TUI. History
+        // lives in vt100's screen offset; a ScrollArea here would only scroll
+        // the one-screenful grid and steal the same wheel event.
+        let mouse_capture = self.session().is_some_and(|session| {
+            session.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        });
+        match wheel_intent(ui, grid_rect, cell.1, &mut self.view, mouse_capture) {
             WheelIntent::Scroll(by) => {
                 if let Some(session) = self.session_mut() {
                     session.scroll_by(by);
+                }
+            }
+            WheelIntent::MouseWheel(by) => {
+                let at = ui.input(|i| i.pointer.hover_pos())
+                    .map(|pos| cell_at_pos(grid_rect.min, cell, pos));
+                let modifiers = ui.input(|i| i.modifiers);
+                if let Some(at) = at
+                    && let Some(session) = self.session_mut()
+                {
+                    session.send_mouse_wheel(by, at, modifiers);
                 }
             }
             WheelIntent::Zoom(factor) => self.zoom_by(factor),
@@ -2308,6 +2488,9 @@ impl Terminal {
             let text = selection_text(session.parser.screen(), sel);
             if !text.is_empty() {
                 ui.ctx().copy_text(text);
+                if let Some(session) = self.session_mut() {
+                    session.selection = None;
+                }
             }
         }
         if paste_clicked {
@@ -2540,7 +2723,9 @@ impl Terminal {
         let pointer_busy = ui.input(|i| i.pointer.any_click());
         let focused_none = ui.memory(|m| m.focused().is_none());
 
-        // Ctrl+Shift+C copies the focused shell's selection, in either layout.
+        // Ctrl+C copies a selection and Ctrl+Shift+C remains an explicit copy
+        // chord. With no selection, Ctrl+C is left for `key_to_bytes` to send as
+        // SIGINT. Clear the tint after copying so it cannot linger over output.
         //
         // It lives here rather than in `ui` because this is the only place that
         // knows which shell is focused: `target` is the Flow pane, `None` the
@@ -2551,26 +2736,38 @@ impl Terminal {
         // Copied through `selection_text`, so the grid's full-width padding is
         // trimmed exactly as it is in the tabbed layout.
         //
-        // Consumed only when there is something to copy, or it would be dead for
-        // the whole app whenever nothing was selected.
+        // Consumed only when there is something to copy, or plain Ctrl+C would
+        // stop interrupting a shell when the user has made no selection.
         let selected = match target {
             Some(id) => self.sessions.iter().find(|s| s.id == id),
             None => self.session(),
         }
         .and_then(|s| {
             s.selection
-                .map(|sel| selection_text(s.parser.screen(), sel))
+                .map(|sel| (s.id, selection_text(s.parser.screen(), sel)))
         })
-        .filter(|text| !text.is_empty());
-        let copy_key = selected.is_some()
-            && ui.input_mut(|i| {
-                i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
-                    eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
-                    eframe::egui::Key::C,
-                ))
+        .filter(|(_, text)| !text.is_empty());
+        let copy_key = selected.as_ref().and_then(|(id, text)| {
+            let copy_event = events.iter().find_map(|event| match event {
+                Event::Key {
+                    key: Key::C,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl || modifiers.command => Some(*modifiers),
+                _ => None,
             });
-        if copy_key && let Some(text) = selected {
+            copy_event.map(|modifiers| (*id, text.clone(), modifiers))
+        });
+        let copied_key = copy_key.is_some();
+        if let Some((id, text, modifiers)) = copy_key {
+            ui.input_mut(|i| {
+                i.consume_key(modifiers, Key::C);
+            });
             ui.ctx().copy_text(text);
+            if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                session.selection = None;
+            }
         }
 
         // Ctrl+Shift+V pastes into the shell. Handled here rather than in `ui`
@@ -2632,6 +2829,15 @@ impl Terminal {
                         modifiers,
                         ..
                     } => {
+                        // `events` is our snapshot from before consuming the
+                        // copy shortcut, so explicitly keep this key out of the
+                        // pty event path as well.
+                        if copied_key
+                            && *key == Key::C
+                            && (modifiers.ctrl || modifiers.command)
+                        {
+                            continue;
+                        }
                         // Never steal editor save / find, and never steal Dim
                         // Mode: Ctrl+Shift+D is an app toggle handled in
                         // `SnorApp::ui` before the terminal sees the key. Plain
@@ -3040,11 +3246,8 @@ impl Terminal {
     /// read from a field because the terminal has no mode flag — the shell owns
     /// that decision, and `flow_target_id` answers in either mode.
     ///
-    /// This is what auto context switching follows. `session.cwd` is the
-    /// directory a shell was *spawned* in, not one it has `cd`-ed into since:
-    /// nothing here parses the shell's own output, so a pane that changes
-    /// directory by hand keeps the directory it started with. That is the
-    /// honest limit of the feature — see `SnorApp::sync_context_root`.
+    /// The directory starts at the spawn path and is updated by shell reports,
+    /// including reports received while this session is in the background.
     pub fn context_session(&self, flow: bool) -> Option<(u64, PathBuf)> {
         // A hidden terminal has no focused tab to speak of, and the section is
         // not on screen to prove otherwise — leaving the explorer where it is
@@ -3586,12 +3789,30 @@ impl<'a> FlowView<'a> {
                 let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
                 let cell = term_cell_size(ui, self.view.font_size);
                 // Wheel in a pane means the same as in the tabbed layout:
-                // history, or zoom with Ctrl. Both are handled before the label
-                // so the gesture never reaches the shell.
-                match wheel_intent(ui, grid_rect, cell.1, self.view) {
+                // history, TUI mouse input when requested, or zoom with Ctrl.
+                let mouse_capture = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+                    .is_some_and(|session| {
+                        session.parser.screen().mouse_protocol_mode()
+                            != vt100::MouseProtocolMode::None
+                    });
+                match wheel_intent(ui, grid_rect, cell.1, self.view, mouse_capture) {
                     WheelIntent::Scroll(by) => {
                         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                             session.scroll_by(by);
+                        }
+                    }
+                    WheelIntent::MouseWheel(by) => {
+                        let at = ui.input(|i| i.pointer.hover_pos())
+                            .map(|pos| cell_at_pos(grid_rect.min, cell, pos));
+                        let modifiers = ui.input(|i| i.modifiers);
+                        if let Some(at) = at
+                            && let Some(session) =
+                                self.sessions.iter_mut().find(|session| session.id == id)
+                        {
+                            session.send_mouse_wheel(by, at, modifiers);
                         }
                     }
                     WheelIntent::Zoom(factor) => {
@@ -4370,7 +4591,7 @@ mod tests {
     fn a_tail_trimmed_to_the_cap_lands_on_a_character_boundary() {
         let mut tail = Vec::new();
         let mut chunk = b"\x1b]0;".to_vec();
-        for _ in 0..200 {
+        for _ in 0..(NOTIF_TAIL_MAX / 3 + 2) {
             // Three bytes each, so the byte cap lands inside one.
             chunk.extend_from_slice("\u{20ac}".as_bytes());
         }
@@ -4441,6 +4662,104 @@ mod tests {
             Notifications::default()
         );
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn directory_reports_survive_every_chunk_boundary_without_attention() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let report = format!("\x1b]9;9;{}\x1b\\", dir.display());
+        for split in 0..=report.len() {
+            let mut t = Terminal::new();
+            sm(&mut t).ingest(&report.as_bytes()[..split]);
+            sm(&mut t).ingest(&report.as_bytes()[split..]);
+            assert_eq!(t.context_session(false).unwrap().1, dir);
+            assert!(!s(&t).attention);
+            assert!(s(&t).last_title.is_none());
+        }
+    }
+
+    #[test]
+    fn directory_reports_refuse_relative_missing_and_malformed_paths() {
+        let mut t = Terminal::new();
+        let original = s(&t).cwd.clone();
+        for report in [
+            "\x1b]9;9;relative\x07",
+            "\x1b]9;9;C:\\snor-directory-that-does-not-exist\\missing\x07",
+            "\x1b]7;file:///C:/bad%ZZpath\x07",
+            "\x1b]7;https://example.com/folder\x07",
+        ] {
+            sm(&mut t).ingest(report.as_bytes());
+            assert_eq!(s(&t).cwd, original);
+            assert!(!s(&t).attention);
+        }
+    }
+
+    #[test]
+    fn native_directory_reports_do_not_hide_the_first_agent_title() {
+        let dir = std::env::temp_dir();
+        let mut t = Terminal::new();
+        let report = format!("\x1b]0;snor-cwd;{}\x07", dir.display());
+        sm(&mut t).ingest(report.as_bytes());
+        assert!(!s(&t).attention);
+        assert!(s(&t).pane_title().is_none());
+        sm(&mut t).ingest(b"\x1b]2;agent: working\x07");
+        assert!(s(&t).attention);
+        assert_eq!(s(&t).pane_title(), Some("agent: working"));
+        sm(&mut t).ingest(report.as_bytes());
+        assert_eq!(s(&t).pane_title(), Some("agent: working"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn osc7_decodes_spaces_unicode_and_percent_signs() {
+        assert_eq!(
+            super::reported_directory("7", "file://my-machine/C:/Other%20project/%E6%96%87%25"),
+            Some(std::path::PathBuf::from("C:/Other project/文%"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_shell_directory_follows_cd_outside_the_project() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("snor-cwd-{}-space ' 文", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for shell in [ShellKind::PowerShell, ShellKind::Cmd] {
+            if !ShellKind::installed().contains(&shell) {
+                continue;
+            }
+            let mut t = Terminal::new();
+            sm(&mut t).shell = shell;
+            t.ensure_started();
+            let command = if shell == ShellKind::Cmd {
+                format!("cd /d \"{}\"\r", dir.display())
+            } else {
+                format!(
+                    "Set-Location -LiteralPath '{}'\r",
+                    dir.display().to_string().replace('\'', "''")
+                )
+            };
+            t.send_bytes(command.as_bytes());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while s(&t).cwd != dir && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                t.poll();
+            }
+            assert_eq!(
+                s(&t).cwd, dir,
+                "{shell:?}: {:?}: {:?}: {}",
+                s(&t).error, s(&t).last_title, s(&t).parser.screen().contents()
+            );
+        }
+        // ConPTY teardown can release the shell's cwd handle after Drop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => break,
+                Err(error) if Instant::now() >= deadline => panic!("cleanup: {error}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
     }
 
     /// Renaming changes what is drawn, never the auto-numbering: `title` is what

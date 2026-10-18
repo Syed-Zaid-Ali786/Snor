@@ -210,7 +210,10 @@ exactly one screenful — so scrolling it moved nothing. `Session::scroll` is th
 intent, `Screen::set_scrollback` is the mechanism, and vt100 0.16 exposes no
 history length, so the offset is set and then read back (`apply_scroll`).
 - **Do not put the grid back inside a `ScrollArea`.** It would both fight the
-  screen's own offset and consume the wheel events that drive it.
+  screen's own offset and consume the wheel events that drive it. When a shell
+  enables xterm mouse reporting, pass wheel rows to that shell with the active
+  mouse encoding instead of moving Snor's scrollback; TUIs such as OpenCode use
+  those reports to scroll their own views.
 - **A history hit is scanned once per offset, at row 0.** Every line of history
   is visible in `rows` different windows at a different row each, so scanning a
   whole window per offset reported one line up to 24 times and "next" walked the
@@ -224,8 +227,9 @@ history length, so the offset is set and then read back (`apply_scroll`).
   selection would copy the grid's full-width padding (every line padded to the
   last column) and fight the tint painted under it. `selection_text` trims each
   row and drops trailing blank rows — that trimming is the entire reason for not
-  using the built-in. Ctrl+C stays SIGINT; `key_to_bytes` refuses the shifted
-  form so Ctrl+Shift+C reaches the app and never the shell.
+  using the built-in. Ctrl+C copies when a non-empty selection exists and
+  otherwise stays SIGINT; Ctrl+Shift+C is the explicit copy chord. Both copy
+  paths clear the selection tint after copying.
 - **The pane header draws two things, and neither may move the grid.** Both the
   agent's self-reported title and the idle readout are *painted* into the band
   `PANE_TOP_CHROME` reserves, exactly like the focus cue, so `size_panes` and the
@@ -445,21 +449,27 @@ list always describes the project the shell you are typing into belongs to. Runs
 in both modes: `Terminal::context_session(flow)` returns the focused pane's id in
 Flow Mode, the active tab's otherwise.
 
-- **It fires on a change of session id, not on the directories differing.** That
-  distinction is the whole design. Comparing directories every frame fights the
-  user: pick a folder from the header's dialog and the very next frame puts the
-  focused shell's directory back, leaving the dialog unable to do anything while
-  any terminal is open. Keying on the session id means a manual choice survives
-  until focus actually moves — which is what "switch context when I move to
-  another terminal" is supposed to mean.
-- **Known limit: `session.cwd` is the directory a shell was *spawned* in**, not
-  one it has `cd`-ed into since. Nothing here reads the shell's own output, so a
-  pane that changes directory by hand keeps the directory it started with and the
-  explorer will not follow it. Following a `cd` needs OSC 7 emitted by the shell
-  and parsed in `terminal.rs`, which PowerShell does not do by default.
-- "Open terminal here" from a folder's context menu is the only way to get two
-  terminals that disagree about their directory, so it is also the only way to
-  exercise this by hand.
+- **It fires on a change of session id or reported directory**, comparing the
+  latest terminal observation against the previous one rather than against the
+  explorer root. A manual folder choice survives unchanged prompts and frames;
+  an actual `cd` or focus switch follows the terminal again.
+- **`session.cwd` starts at the spawn directory and follows shell reports.**
+  PowerShell/pwsh use a process-local prompt wrapper and Command Prompt extends
+  its process-local `PROMPT`. Native Windows reports use a reserved
+  `snor-cwd;` title prefix: ConPTY drops unsupported OSCs and Windows PowerShell
+  does not enable VT output by default, so writing OSC 7 directly did not work
+  in the real shell test. These reports never become pane titles or attention
+  events. The first prompt counts as the startup introduction so the first
+  later agent title still raises attention. No user profile is modified.
+- **OSC 7 and OSC 9;9 are also accepted**, including split sequences and
+  percent-encoded UTF-8 file URIs. Only absolute directories that exist on this
+  machine are adopted. Git Bash receives a `PROMPT_COMMAND` hook using
+  `pwd -W`; startup scripts can replace it. WSL Linux directories do not yet
+  have automatic mapping into Windows explorer paths.
+- To exercise it, `cd` to a folder outside the project, switch to a terminal
+  in a different directory and back, and check the explorer in both layouts.
+  The live regression test covers PowerShell and Command Prompt with a temporary
+  directory outside the project containing spaces, an apostrophe and Unicode.
 - Verified live end-to-end: right-click `src` → *open terminal here* re-roots the
   explorer from `Snor` to `src` (header reads `src`, lists the 13 `.rs` files);
   clicking back to tab 1 re-roots it to `Snor`. Guarded by tests

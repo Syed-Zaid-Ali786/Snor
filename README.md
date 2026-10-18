@@ -40,12 +40,14 @@ without constantly switching tools.
   the last tab hides the panel, `Ctrl+Tab` brings it back). Pick the shell new
   tabs start — PowerShell, PowerShell 7, Command Prompt, Git Bash or WSL — and
   each tab is named after the shell it runs. Click any shell and type directly —
-  Enter, arrows, Tab, Backspace, Ctrl+C all reach it. It answers DSR/CPR/DA
+  Enter, arrows, Tab and Backspace reach it. Ctrl+C copies a selected region or
+  interrupts the shell when nothing is selected. It answers DSR/CPR/DA
   queries so PSReadLine never blocks.
 - Terminal history that is actually reachable: the wheel scrolls back through
-  1000 lines by default, find searches them (live output and history), and
-  `Ctrl+Shift+C` copies the selection with the grid's padding trimmed off so it
-  pastes cleanly. `Ctrl+wheel` zooms the grid text.
+  1000 lines by default, and goes to a running TUI when it requests mouse
+  input. Find searches terminal output (live and history), and
+  `Ctrl+C` (or `Ctrl+Shift+C`) copies the selection with the grid's padding
+  trimmed off, then clears the highlight. `Ctrl+wheel` zooms the grid text.
 - Attention flags: a shell that rings its bell or retitles itself since you
   last focused it gets an accent mark on its tab or pane, and `Ctrl+Shift+A`
   jumps straight to the next one — no cycling to find out who is waiting. That
@@ -157,7 +159,8 @@ whole flow.
 | `F11` | Fullscreen |
 | `Ctrl+S` / `Ctrl+F` | Save / find in file |
 | `Ctrl+Shift+A` | Jump to the next shell (or tab) that needs attention |
-| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / paste into the terminal |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copy a selection; Ctrl+C interrupts with no selection |
+| `Ctrl+Shift+V` | Paste into the terminal |
 | Wheel over a terminal | Scroll back through history |
 | `Ctrl+wheel` | Zoom the terminal text |
 | Right-click a terminal tab | Rename or close it |
