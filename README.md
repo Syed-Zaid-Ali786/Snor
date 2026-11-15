@@ -1,8 +1,8 @@
 # Snor — a lightweight native workspace for agent-driven development
 
-[![ci](https://github.com/MR-STARK87/Snor/actions/workflows/ci.yml/badge.svg)](https://github.com/MR-STARK87/Snor/actions)
+[![ci](https://github.com/Syed-Zaid-Ali786/Snor/actions/workflows/ci.yml/badge.svg)](https://github.com/Syed-Zaid-Ali786/Snor/actions)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
-[![platform](https://img.shields.io/badge/platform-Windows-blue)](https://github.com/MR-STARK87/Snor)
+[![platform](https://img.shields.io/badge/platform-Windows-blue)](https://github.com/Syed-Zaid-Ali786/Snor)
 
 Snor is a minimal IDE in full Rust, designed around one idea: the developer's
 job is shifting from typing every line of code to directing, supervising, and

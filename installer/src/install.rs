@@ -257,7 +257,7 @@ fn register(dir: &Path, exe: &Path) -> Result<(), String> {
         ("DisplayName", "REG_SZ", "Snor".into()),
         ("DisplayVersion", "REG_SZ", env!("CARGO_PKG_VERSION").into()),
         ("Publisher", "REG_SZ", "Snor".into()),
-        ("URLInfoAbout", "REG_SZ", "https://github.com/MR-STARK87/Snor".into()),
+        ("URLInfoAbout", "REG_SZ", "https://github.com/Syed-Zaid-Ali786/Snor".into()),
         ("InstallLocation", "REG_SZ", dir.display().to_string()),
         ("DisplayIcon", "REG_SZ", format!("{},0", exe.display())),
         ("UninstallString", "REG_SZ", quoted_uninstaller),
